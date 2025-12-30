@@ -1,3 +1,4 @@
+import { appendFileSync, mkdirSync } from "fs";
 import OpenAI from "openai";
 import type {
 	Tool as OpenAITool,
@@ -10,6 +11,7 @@ import type {
 	ResponseOutputMessage,
 	ResponseReasoningItem,
 } from "openai/resources/responses/responses.js";
+import { dirname } from "path";
 import { calculateCost } from "../models.js";
 import { getEnvApiKey } from "../stream.js";
 import type {
@@ -42,6 +44,147 @@ function shortHash(str: string): string {
 	h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
 	h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
 	return (h2 >>> 0).toString(36) + (h1 >>> 0).toString(36);
+}
+
+type FetchFn = typeof fetch;
+type FetchRequestInfo = Parameters<FetchFn>[0];
+type FetchRequestInit = NonNullable<Parameters<FetchFn>[1]>;
+type FetchBodyInit = FetchRequestInit["body"];
+type FetchHeadersInit = FetchRequestInit["headers"];
+
+let httpRequestSequence = 0;
+
+function nextHttpRequestId(): string {
+	httpRequestSequence += 1;
+	return `http_${Date.now()}_${httpRequestSequence}`;
+}
+
+function writeHttpLog(logPath: string, entry: Record<string, unknown>): void {
+	try {
+		mkdirSync(dirname(logPath), { recursive: true });
+		appendFileSync(logPath, `${JSON.stringify(entry)}\n`);
+	} catch {
+		// Best-effort logging only.
+	}
+}
+
+function headersToRecord(headers?: FetchHeadersInit | Headers): Record<string, string> {
+	const record: Record<string, string> = {};
+	if (!headers) {
+		return record;
+	}
+	const normalized = new Headers(headers);
+	normalized.forEach((value, key) => {
+		record[key] = value;
+	});
+	return record;
+}
+
+function isReadableStream(value: unknown): value is ReadableStream<Uint8Array> {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	const candidate = value as { getReader?: unknown };
+	return typeof candidate.getReader === "function";
+}
+
+function serializeBody(body?: FetchBodyInit | null): { bodyText?: string; bodyType?: string } {
+	if (body === undefined || body === null) {
+		return {};
+	}
+	if (typeof body === "string") {
+		return { bodyText: body };
+	}
+	if (body instanceof URLSearchParams) {
+		return { bodyText: body.toString() };
+	}
+	if (body instanceof ArrayBuffer) {
+		return { bodyText: new TextDecoder().decode(new Uint8Array(body)) };
+	}
+	if (ArrayBuffer.isView(body)) {
+		return { bodyText: new TextDecoder().decode(new Uint8Array(body.buffer, body.byteOffset, body.byteLength)) };
+	}
+	if (isReadableStream(body)) {
+		return { bodyType: "ReadableStream" };
+	}
+	if (typeof body === "object" && "constructor" in body) {
+		const ctor = (body as { constructor?: { name?: string } }).constructor;
+		return { bodyType: ctor?.name ?? "object" };
+	}
+	return { bodyType: typeof body };
+}
+
+function requestInfoToUrl(input: FetchRequestInfo): string {
+	if (typeof input === "string") return input;
+	if (input instanceof URL) return input.toString();
+	return input.url;
+}
+
+function requestInfoToMethod(input: FetchRequestInfo, init?: FetchRequestInit): string {
+	if (init?.method) return init.method;
+	if (input instanceof Request) return input.method;
+	return "GET";
+}
+
+function maybeGetLoggedFetch(model: Model<"openai-responses">): FetchFn | undefined {
+	const logPath = process.env.PI_LOG_HTTP_PATH;
+	if (!logPath) {
+		return undefined;
+	}
+
+	const baseFetch = globalThis.fetch as FetchFn | undefined;
+	if (!baseFetch) {
+		return undefined;
+	}
+
+	return async (input: FetchRequestInfo, init?: FetchRequestInit): Promise<Response> => {
+		const requestId = nextHttpRequestId();
+		const startedAt = Date.now();
+		const url = requestInfoToUrl(input);
+		const method = requestInfoToMethod(input, init);
+		const headers = headersToRecord(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+		const { bodyText, bodyType } = serializeBody(init?.body ?? (input instanceof Request ? input.body : undefined));
+
+		writeHttpLog(logPath, {
+			timestamp: new Date().toISOString(),
+			requestId,
+			direction: "request",
+			provider: model.provider,
+			model: model.id,
+			method,
+			url,
+			headers,
+			...(bodyText !== undefined ? { bodyText } : {}),
+			...(bodyType ? { bodyType } : {}),
+		});
+
+		const response = await baseFetch(input, init);
+		const responseHeaders = headersToRecord(response.headers);
+		const responseInfo = {
+			timestamp: new Date().toISOString(),
+			requestId,
+			direction: "response",
+			provider: model.provider,
+			model: model.id,
+			status: response.status,
+			statusText: response.statusText,
+			durationMs: Date.now() - startedAt,
+			headers: responseHeaders,
+		};
+
+		void response
+			.clone()
+			.text()
+			.then((body: string) => {
+				writeHttpLog(logPath, { ...responseInfo, bodyText: body });
+			})
+			.catch((error: unknown) => {
+				const message = error instanceof Error ? error.message : String(error);
+				writeHttpLog(logPath, { ...responseInfo, error: message });
+			});
+
+		return response;
+	};
 }
 
 // OpenAI Responses-specific options
@@ -83,8 +226,10 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 		try {
 			// Create OpenAI client
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
-			const client = createClient(model, context, apiKey);
+			const headers = buildHeaders(model, context);
+			const client = createClient(model, context, apiKey, headers);
 			const params = buildParams(model, context, options);
+			maybeLogRequest(model, params, headers);
 			const openaiStream = await client.responses.create(params, { signal: options?.signal });
 			stream.push({ type: "start", partial: output });
 
@@ -312,7 +457,12 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 	return stream;
 };
 
-function createClient(model: Model<"openai-responses">, context: Context, apiKey?: string) {
+function createClient(
+	model: Model<"openai-responses">,
+	context: Context,
+	apiKey?: string,
+	headers?: Record<string, string>,
+) {
 	if (!apiKey) {
 		if (!process.env.OPENAI_API_KEY) {
 			throw new Error(
@@ -322,6 +472,19 @@ function createClient(model: Model<"openai-responses">, context: Context, apiKey
 		apiKey = process.env.OPENAI_API_KEY;
 	}
 
+	const resolvedHeaders = headers ?? buildHeaders(model, context);
+	const loggedFetch = maybeGetLoggedFetch(model);
+
+	return new OpenAI({
+		apiKey,
+		baseURL: model.baseUrl,
+		dangerouslyAllowBrowser: true,
+		defaultHeaders: resolvedHeaders,
+		...(loggedFetch ? { fetch: loggedFetch } : {}),
+	});
+}
+
+function buildHeaders(model: Model<"openai-responses">, context: Context): Record<string, string> {
 	const headers = { ...model.headers };
 	if (model.provider === "github-copilot") {
 		// Copilot expects X-Initiator to indicate whether the request is user-initiated
@@ -348,24 +511,20 @@ function createClient(model: Model<"openai-responses">, context: Context, apiKey
 		}
 	}
 
-	return new OpenAI({
-		apiKey,
-		baseURL: model.baseUrl,
-		dangerouslyAllowBrowser: true,
-		defaultHeaders: headers,
-	});
+	return headers;
 }
 
 function buildParams(model: Model<"openai-responses">, context: Context, options?: OpenAIResponsesOptions) {
-	const messages = convertMessages(model, context);
+	const useInstructions = model.provider.toLowerCase() === "codex";
+	const messages = convertMessages(model, context, useInstructions);
 
-	const params: ResponseCreateParamsStreaming = {
+	const params: ResponseCreateParamsStreaming & { instructions?: string; store?: boolean } = {
 		model: model.id,
 		input: messages,
 		stream: true,
 	};
 
-	if (options?.maxTokens) {
+	if (options?.maxTokens && !useInstructions) {
 		params.max_output_tokens = options?.maxTokens;
 	}
 
@@ -374,7 +533,14 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 	}
 
 	if (context.tools) {
-		params.tools = convertTools(context.tools);
+		params.tools = convertTools(context.tools, useInstructions);
+	}
+
+	if (useInstructions) {
+		params.store = false;
+		if (context.systemPrompt) {
+			params.instructions = sanitizeSurrogates(context.systemPrompt);
+		}
 	}
 
 	if (model.reasoning) {
@@ -384,7 +550,7 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 				summary: options?.reasoningSummary || "auto",
 			};
 			params.include = ["reasoning.encrypted_content"];
-		} else {
+		} else if (!useInstructions) {
 			if (model.name.startsWith("gpt-5")) {
 				// Jesus Christ, see https://community.openai.com/t/need-reasoning-false-option-for-gpt-5/1351588/7
 				messages.push({
@@ -403,12 +569,12 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 	return params;
 }
 
-function convertMessages(model: Model<"openai-responses">, context: Context): ResponseInput {
+function convertMessages(model: Model<"openai-responses">, context: Context, useInstructions: boolean): ResponseInput {
 	const messages: ResponseInput = [];
 
 	const transformedMessages = transformMessages(context.messages, model);
 
-	if (context.systemPrompt) {
+	if (context.systemPrompt && !useInstructions) {
 		const role = model.reasoning ? "developer" : "system";
 		messages.push({
 			role,
@@ -420,10 +586,18 @@ function convertMessages(model: Model<"openai-responses">, context: Context): Re
 	for (const msg of transformedMessages) {
 		if (msg.role === "user") {
 			if (typeof msg.content === "string") {
-				messages.push({
-					role: "user",
-					content: [{ type: "input_text", text: sanitizeSurrogates(msg.content) }],
-				});
+				if (useInstructions) {
+					messages.push({
+						type: "message",
+						role: "user",
+						content: [{ type: "input_text", text: sanitizeSurrogates(msg.content) }],
+					});
+				} else {
+					messages.push({
+						role: "user",
+						content: [{ type: "input_text", text: sanitizeSurrogates(msg.content) }],
+					});
+				}
 			} else {
 				const content: ResponseInputContent[] = msg.content.map((item): ResponseInputContent => {
 					if (item.type === "text") {
@@ -443,47 +617,73 @@ function convertMessages(model: Model<"openai-responses">, context: Context): Re
 					? content.filter((c) => c.type !== "input_image")
 					: content;
 				if (filteredContent.length === 0) continue;
-				messages.push({
-					role: "user",
-					content: filteredContent,
-				});
+				if (useInstructions) {
+					messages.push({
+						type: "message",
+						role: "user",
+						content: filteredContent,
+					});
+				} else {
+					messages.push({
+						role: "user",
+						content: filteredContent,
+					});
+				}
 			}
 		} else if (msg.role === "assistant") {
 			const output: ResponseInput = [];
 
 			for (const block of msg.content) {
 				// Do not submit thinking blocks if the completion had an error (i.e. abort)
-				if (block.type === "thinking" && msg.stopReason !== "error") {
+				if (block.type === "thinking" && msg.stopReason !== "error" && !useInstructions) {
 					if (block.thinkingSignature) {
 						const reasoningItem = JSON.parse(block.thinkingSignature);
 						output.push(reasoningItem);
 					}
 				} else if (block.type === "text") {
 					const textBlock = block as TextContent;
-					// OpenAI requires id to be max 64 characters
-					let msgId = textBlock.textSignature;
-					if (!msgId) {
-						msgId = `msg_${msgIndex}`;
-					} else if (msgId.length > 64) {
-						msgId = `msg_${shortHash(msgId)}`;
+					if (useInstructions) {
+						output.push({
+							type: "message",
+							role: "assistant",
+							content: [{ type: "output_text", text: sanitizeSurrogates(textBlock.text) }],
+						} as any);
+					} else {
+						// OpenAI requires id to be max 64 characters
+						let msgId = textBlock.textSignature;
+						if (!msgId) {
+							msgId = `msg_${msgIndex}`;
+						} else if (msgId.length > 64) {
+							msgId = `msg_${shortHash(msgId)}`;
+						}
+						output.push({
+							type: "message",
+							role: "assistant",
+							content: [{ type: "output_text", text: sanitizeSurrogates(textBlock.text), annotations: [] }],
+							status: "completed",
+							id: msgId,
+						} satisfies ResponseOutputMessage);
 					}
-					output.push({
-						type: "message",
-						role: "assistant",
-						content: [{ type: "output_text", text: sanitizeSurrogates(textBlock.text), annotations: [] }],
-						status: "completed",
-						id: msgId,
-					} satisfies ResponseOutputMessage);
 					// Do not submit toolcall blocks if the completion had an error (i.e. abort)
 				} else if (block.type === "toolCall" && msg.stopReason !== "error") {
 					const toolCall = block as ToolCall;
-					output.push({
-						type: "function_call",
-						id: toolCall.id.split("|")[1],
-						call_id: toolCall.id.split("|")[0],
-						name: toolCall.name,
-						arguments: JSON.stringify(toolCall.arguments),
-					});
+					const [callId, itemId] = toolCall.id.split("|");
+					if (useInstructions) {
+						output.push({
+							type: "function_call",
+							call_id: callId,
+							name: toolCall.name,
+							arguments: JSON.stringify(toolCall.arguments),
+						} as any);
+					} else {
+						output.push({
+							type: "function_call",
+							id: itemId,
+							call_id: callId,
+							name: toolCall.name,
+							arguments: JSON.stringify(toolCall.arguments),
+						});
+					}
 				}
 			}
 			if (output.length === 0) continue;
@@ -528,7 +728,8 @@ function convertMessages(model: Model<"openai-responses">, context: Context): Re
 				messages.push({
 					role: "user",
 					content: contentParts,
-				});
+					...(useInstructions ? { type: "message" } : {}),
+				} as any);
 			}
 		}
 		msgIndex++;
@@ -537,14 +738,62 @@ function convertMessages(model: Model<"openai-responses">, context: Context): Re
 	return messages;
 }
 
-function convertTools(tools: Tool[]): OpenAITool[] {
-	return tools.map((tool) => ({
-		type: "function",
-		name: tool.name,
-		description: tool.description,
-		parameters: tool.parameters as any, // TypeBox already generates JSON Schema
-		strict: null,
-	}));
+function convertTools(tools: Tool[], useInstructions: boolean): OpenAITool[] {
+	return tools.map((tool) => {
+		const base = {
+			type: "function",
+			name: tool.name,
+			description: tool.description,
+			parameters: tool.parameters as any, // TypeBox already generates JSON Schema
+		};
+		if (useInstructions) {
+			return base as OpenAITool;
+		}
+		return { ...base, strict: null } as OpenAITool;
+	});
+}
+
+function maybeLogRequest(
+	model: Model<"openai-responses">,
+	params: ResponseCreateParamsStreaming & { instructions?: string; store?: boolean },
+	headers: Record<string, string>,
+): void {
+	const logPath = process.env.PI_LOG_REQUESTS_PATH;
+	if (!logPath) {
+		return;
+	}
+	try {
+		const redactedParams = JSON.parse(
+			JSON.stringify(params, (key, value) => {
+				if (key === "image_url" && typeof value === "string" && value.startsWith("data:")) {
+					const base64Index = value.indexOf("base64,");
+					const size = base64Index === -1 ? value.length : value.length - (base64Index + "base64,".length);
+					return `data:<omitted base64 ${size} chars>`;
+				}
+				return value;
+			}),
+		);
+		const redactedHeaders: Record<string, string> = {};
+		for (const [key, value] of Object.entries(headers)) {
+			if (/authorization/i.test(key)) {
+				redactedHeaders[key] = "<redacted>";
+			} else {
+				redactedHeaders[key] = value;
+			}
+		}
+		const entry = {
+			timestamp: new Date().toISOString(),
+			provider: model.provider,
+			model: model.id,
+			baseUrl: model.baseUrl,
+			headers: redactedHeaders,
+			params: redactedParams,
+		};
+		mkdirSync(dirname(logPath), { recursive: true });
+		appendFileSync(logPath, `${JSON.stringify(entry)}\n`);
+	} catch {
+		// Best-effort logging only.
+	}
 }
 
 function mapStopReason(status: OpenAI.Responses.ResponseStatus | undefined): StopReason {

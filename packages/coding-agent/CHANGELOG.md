@@ -5,6 +5,13 @@
 ### Added
 
 - **`enabledModels` setting**: Configure whitelisted models in `settings.json` (same format as `--models` CLI flag). CLI `--models` takes precedence over the setting.
+- **Codex auth support**: Added `--codex-auth` and `--codex-provider` to load Codex auth.json/prompt files and inject required headers.
+- **Request payload logging**: Added `--log-requests` and `--log-requests-path` to write OpenAI Responses request payloads to JSONL.
+- **Raw HTTP logging**: Added `--log-http` and `--log-http-path` to write OpenAI Responses request/response payloads to JSONL.
+
+### Fixed
+
+- **Codex instructions format**: Use the raw Codex prompt without appending project context/skills when `--codex-auth` is enabled.
 
 ### Fixed
 

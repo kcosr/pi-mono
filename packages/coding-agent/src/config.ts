@@ -141,3 +141,13 @@ export function getSessionsDir(): string {
 export function getDebugLogPath(): string {
 	return join(getAgentDir(), `${APP_NAME}-debug.log`);
 }
+
+/** Get path to request log file */
+export function getRequestLogPath(): string {
+	return join(getAgentDir(), `${APP_NAME}-requests.jsonl`);
+}
+
+/** Get path to HTTP log file */
+export function getHttpLogPath(): string {
+	return join(getAgentDir(), `${APP_NAME}-http.jsonl`);
+}

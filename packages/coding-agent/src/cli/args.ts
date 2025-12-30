@@ -13,6 +13,12 @@ export interface Args {
 	provider?: string;
 	model?: string;
 	apiKey?: string;
+	codexAuth?: boolean;
+	codexProvider?: string;
+	logRequests?: boolean;
+	logRequestsPath?: string;
+	logHttp?: boolean;
+	logHttpPath?: string;
 	systemPrompt?: string;
 	appendSystemPrompt?: string;
 	thinking?: ThinkingLevel;
@@ -71,6 +77,18 @@ export function parseArgs(args: string[]): Args {
 			result.model = args[++i];
 		} else if (arg === "--api-key" && i + 1 < args.length) {
 			result.apiKey = args[++i];
+		} else if (arg === "--codex-auth") {
+			result.codexAuth = true;
+		} else if (arg === "--codex-provider" && i + 1 < args.length) {
+			result.codexProvider = args[++i];
+		} else if (arg === "--log-requests") {
+			result.logRequests = true;
+		} else if (arg === "--log-requests-path" && i + 1 < args.length) {
+			result.logRequestsPath = args[++i];
+		} else if (arg === "--log-http") {
+			result.logHttp = true;
+		} else if (arg === "--log-http-path" && i + 1 < args.length) {
+			result.logHttpPath = args[++i];
 		} else if (arg === "--system-prompt" && i + 1 < args.length) {
 			result.systemPrompt = args[++i];
 		} else if (arg === "--append-system-prompt" && i + 1 < args.length) {
@@ -149,6 +167,12 @@ ${chalk.bold("Options:")}
   --provider <name>              Provider name (default: google)
   --model <id>                   Model ID (default: gemini-2.5-flash)
   --api-key <key>                API key (defaults to env vars)
+  --codex-auth                   Load Codex auth.json and prompt files (provider "codex" by default)
+  --codex-provider <name>        Provider name for Codex auth (default: codex)
+  --log-requests                 Log OpenAI Responses request payloads to a JSONL file
+  --log-requests-path <file>     Log OpenAI Responses request payloads to a specific JSONL file
+  --log-http                     Log raw OpenAI Responses HTTP request/response payloads to JSONL
+  --log-http-path <file>         Log raw OpenAI Responses HTTP payloads to a specific JSONL file
   --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt
   --mode <mode>                  Output mode: text (default), json, or rpc
@@ -220,6 +244,8 @@ ${chalk.bold("Environment Variables:")}
   OPENROUTER_API_KEY      - OpenRouter API key
   ZAI_API_KEY             - ZAI API key
   ${ENV_AGENT_DIR.padEnd(23)} - Session storage directory (default: ~/${CONFIG_DIR_NAME}/agent)
+  PI_LOG_REQUESTS_PATH    - JSONL file for logging OpenAI Responses request payloads
+  PI_LOG_HTTP_PATH        - JSONL file for logging raw OpenAI Responses HTTP payloads
 
 ${chalk.bold("Available Tools (default: read, bash, edit, write):")}
   read   - Read file contents

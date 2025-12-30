@@ -14,9 +14,11 @@ import { type Args, parseArgs, printHelp } from "./cli/args.js";
 import { processFileArguments } from "./cli/file-processor.js";
 import { listModels } from "./cli/list-models.js";
 import { selectSession } from "./cli/session-picker.js";
-import { CONFIG_DIR_NAME, getAgentDir, getModelsPath, VERSION } from "./config.js";
+import { CONFIG_DIR_NAME, getAgentDir, getHttpLogPath, getModelsPath, getRequestLogPath, VERSION } from "./config.js";
 import type { AgentSession } from "./core/agent-session.js";
 
+import type { AuthStorage } from "./core/auth-storage.js";
+import { CODEX_ORIGINATOR, CODEX_PROVIDER, findCodexPromptFile, loadCodexAuth } from "./core/codex-auth.js";
 import type { LoadedCustomTool } from "./core/custom-tools/index.js";
 import { exportFromFile } from "./core/export-html.js";
 import type { HookUIContext } from "./core/index.js";
@@ -169,6 +171,71 @@ function getChangelogForDisplay(parsed: Args, settingsManager: SettingsManager):
 	return null;
 }
 
+function applyCodexAuth(parsed: Args, authStorage: AuthStorage, modelRegistry: ModelRegistry): void {
+	if (!parsed.codexAuth) {
+		return;
+	}
+
+	let codexAuth: { accessToken: string; accountId: string };
+	try {
+		codexAuth = loadCodexAuth();
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		console.error(chalk.red(`Error: ${message}`));
+		process.exit(1);
+	}
+
+	const provider = parsed.codexProvider || CODEX_PROVIDER;
+	authStorage.setRuntimeApiKey(provider, codexAuth.accessToken);
+
+	const codexHeaders: Record<string, string> = {
+		"ChatGPT-Account-ID": codexAuth.accountId,
+	};
+	const hasOriginator = modelRegistry
+		.getAll()
+		.some((model) => model.provider === provider && model.headers?.originator);
+	if (!hasOriginator) {
+		codexHeaders.originator = CODEX_ORIGINATOR;
+	}
+	modelRegistry.setProviderHeaderOverride(provider, codexHeaders);
+
+	if (!parsed.systemPrompt) {
+		const promptPath = findCodexPromptFile();
+		if (!promptPath) {
+			console.error(chalk.red("Error: Could not find Codex prompt file."));
+			console.error(chalk.yellow("Set CODEX_REPO to your Codex checkout or pass --system-prompt."));
+			process.exit(1);
+		}
+		parsed.systemPrompt = promptPath;
+	}
+}
+
+function applyRequestLogging(parsed: Args): void {
+	if (parsed.logRequestsPath) {
+		process.env.PI_LOG_REQUESTS_PATH = parsed.logRequestsPath;
+		return;
+	}
+	if (process.env.PI_LOG_REQUESTS_PATH) {
+		return;
+	}
+	if (parsed.logRequests) {
+		process.env.PI_LOG_REQUESTS_PATH = getRequestLogPath();
+	}
+}
+
+function applyHttpLogging(parsed: Args): void {
+	if (parsed.logHttpPath) {
+		process.env.PI_LOG_HTTP_PATH = parsed.logHttpPath;
+		return;
+	}
+	if (process.env.PI_LOG_HTTP_PATH) {
+		return;
+	}
+	if (parsed.logHttp) {
+		process.env.PI_LOG_HTTP_PATH = getHttpLogPath();
+	}
+}
+
 function createSessionManager(parsed: Args, cwd: string): SessionManager | null {
 	if (parsed.noSession) {
 		return SessionManager.inMemory();
@@ -250,7 +317,12 @@ function buildSessionOptions(
 	// (handled by caller before createAgentSession)
 
 	// System prompt
-	if (resolvedSystemPrompt && resolvedAppendPrompt) {
+	if (parsed.codexAuth && resolvedSystemPrompt) {
+		const rawPrompt = resolvedAppendPrompt
+			? `${resolvedSystemPrompt}\n\n${resolvedAppendPrompt}`
+			: resolvedSystemPrompt;
+		options.systemPrompt = () => rawPrompt;
+	} else if (resolvedSystemPrompt && resolvedAppendPrompt) {
 		options.systemPrompt = `${resolvedSystemPrompt}\n\n${resolvedAppendPrompt}`;
 	} else if (resolvedSystemPrompt) {
 		options.systemPrompt = resolvedSystemPrompt;
@@ -304,6 +376,10 @@ export async function main(args: string[]) {
 		printHelp();
 		return;
 	}
+
+	applyCodexAuth(parsed, authStorage, modelRegistry);
+	applyRequestLogging(parsed);
+	applyHttpLogging(parsed);
 
 	if (parsed.listModels !== undefined) {
 		const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
