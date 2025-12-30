@@ -90,6 +90,7 @@ function resolveApiKeyConfig(keyConfig: string): string | undefined {
 export class ModelRegistry {
 	private models: Model<Api>[] = [];
 	private customProviderApiKeys: Map<string, string> = new Map();
+	private providerHeaderOverrides: Map<string, Record<string, string>> = new Map();
 	private loadError: string | null = null;
 
 	constructor(
@@ -125,6 +126,14 @@ export class ModelRegistry {
 		return this.loadError;
 	}
 
+	/**
+	 * Override headers for all models of a provider (merged on top of existing headers).
+	 */
+	setProviderHeaderOverride(provider: string, headers: Record<string, string>): void {
+		this.providerHeaderOverrides.set(provider, headers);
+		this.applyProviderHeaderOverrides();
+	}
+
 	private loadModels(): void {
 		// Load built-in models
 		const builtInModels: Model<Api>[] = [];
@@ -158,6 +167,8 @@ export class ModelRegistry {
 		} else {
 			this.models = combined;
 		}
+
+		this.applyProviderHeaderOverrides();
 	}
 
 	private loadCustomModels(modelsJsonPath: string): { models: Model<Api>[]; error: string | null } {
@@ -267,6 +278,20 @@ export class ModelRegistry {
 		}
 
 		return models;
+	}
+
+	private applyProviderHeaderOverrides(): void {
+		if (this.providerHeaderOverrides.size === 0) {
+			return;
+		}
+		this.models = this.models.map((model) => {
+			const override = this.providerHeaderOverrides.get(model.provider);
+			if (!override) {
+				return model;
+			}
+			const headers = model.headers ? { ...model.headers, ...override } : { ...override };
+			return { ...model, headers };
+		});
 	}
 
 	/**

@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Codex provider support for Responses `instructions` and `store` fields.
+- OpenAI Responses HTTP debug logging via `PI_LOG_HTTP_PATH`.
+
+### Fixed
+
+- Codex Responses payload formatting now matches codex-chat (assistant message schema, tool strict field, gpt-5 reasoning hack).
+
 ## [0.28.0] - 2025-12-25
 
 ### Breaking Changes
